@@ -1,0 +1,33 @@
+---Header -> fixed 16 bytes
+Magic (int32):0x00444E42 (BND)
+Version? (int32): must be a version value
+Info Offset (int32): jumps to 0x10 (not a ideal name but just a made up one)
+Table Offset (int32): jumps to 0x20 (table of contents area.)
+
+--- Info Offset -> fixed 16 bytes
+Entry Info Area/Start Point (int32): information on Entry Info starting point
+Chunks (int32): jumps to where all data is stored
+Padding (8 bytes): probably used in game. so skipping it.
+
+
+Tables Section (Table of Content/TOC) area [0x20]
+--- Table Offset
+Total files (int32): all files, excluding directories
+Total entries (int32): all entries, including dirs
+[
+  Hash (uint32): checksum value, crc32. used for both directory and filename (strings)
+  Entry Info Offset (int32): pointer to an entry info section
+  File Offset (int32)
+  File Size (int32)
+]
+
+--- Entry Info Offset
+???: 3 bytes of unknown data
+Entry Offset (int32): just a pointer back that goes to itself in the table section
+Filename (string):  read until null terminated (utf-8)
+
+
+--- Reading Hash (sorting, useful on where to put files on extraction)
+use crc32 checking to match directory + filename
+? [directory string] + [filename string] + [entry hash value] = [result]
+? bad result?, try to use other directory string until you find a match
