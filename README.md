@@ -6,4 +6,4 @@ This tool is experimental, expect weird stuff...
 
 Usage:
 - Extraction: -x [input file]
-- Repacking: -x [input file] [input folder, for that input file] `(example: -r data.bnd data)`
+- Repacking: -r [input file] [input folder, for that input file] `(example: -r data.bnd data)`
