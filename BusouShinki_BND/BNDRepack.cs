@@ -1,6 +1,4 @@
-﻿// --- START OF FILE BNDRepack.cs ---
-
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -10,7 +8,6 @@ namespace BusouShinki_BND
 {
     public class BNDRepack
     {
-
         private int magic;
         private int version;
         private int infoOffset;
@@ -20,23 +17,22 @@ namespace BusouShinki_BND
         private int totalFiles;
         private int totalEntries;
         private List<Entry> entries = new List<Entry>();
-        private Crc32 crc = new Crc32(); 
+        private Crc32 crc = new Crc32();
 
+        // Cache for directory path combinations
+        private Dictionary<uint, string> hashToPathCache = new Dictionary<uint, string>();
 
         public void Repack(string originalBndPath, string inputFolderPath)
         {
             Console.WriteLine("--- BND Repack Initialized ---");
 
-            // 1. Index the original BND file to get its structure
             IndexBndFile(originalBndPath);
             Console.WriteLine($"[INDEX] Indexed {entries.Count} entries from '{Path.GetFileName(originalBndPath)}'.");
 
-            // 2. Build the new BND file
             BuildNewBnd(originalBndPath, inputFolderPath);
 
             Console.WriteLine("--- BND Repack Completed ---");
         }
-
 
         // Reads the structure of an existing BND file into memory.
         // This is similar to BNDUnpack.Load but for repacking side.
@@ -45,19 +41,19 @@ namespace BusouShinki_BND
             using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read))
             using (var br = new BinaryReader(fs))
             {
-                // Read header
+                // header
                 magic = br.ReadInt32();
                 if (magic != 0x00444E42) throw new Exception("Invalid BND magic value.");
                 version = br.ReadInt32();
                 infoOffset = br.ReadInt32();
                 tableOffset = br.ReadInt32();
 
-                // Read info section
+                // Info Section
                 fs.Position = infoOffset;
                 entryInfoArea = br.ReadInt32();
                 chunks = br.ReadInt32();
 
-                // Read table of contents (TOC)
+                // Read TOC
                 fs.Position = tableOffset;
                 totalFiles = br.ReadInt32();
                 totalEntries = br.ReadInt32();
@@ -74,7 +70,7 @@ namespace BusouShinki_BND
                         FileSize = br.ReadInt32()
                     });
                 }
-
+                
                 // Parse entry info for each entry to get names
                 foreach (var e in entries)
                 {
@@ -90,10 +86,48 @@ namespace BusouShinki_BND
                     e.Name = Encoding.UTF8.GetString(nameBytes.ToArray());
                 }
             }
+
+            // Pre-compution for hash-to-path mappings
+            PrecomputeHashMaps();
         }
 
+        private void PrecomputeHashMaps()
+        {
+            var dirEntries = entries.Where(e => e.FileSize == 0).ToList();
+            var fileEntries = entries.Where(e => e.FileSize > 0).ToList();
 
-        // Constructs the new BND file by writing data and updating the TOC.
+            foreach (var file in fileEntries)
+            {
+                // Try direct match first
+                if (!hashToPathCache.ContainsKey(file.Hash))
+                {
+                    hashToPathCache[file.Hash] = file.Name;
+                }
+
+                // Try all directory combinations
+                foreach (var dir in dirEntries)
+                {
+                    string testPath1 = dir.Name + file.Name;
+                    byte[] testBytes1 = Encoding.UTF8.GetBytes(testPath1);
+                    uint computed1 = crc.Compute(testBytes1);
+                    if (computed1 == file.Hash)
+                    {
+                        hashToPathCache[file.Hash] = testPath1;
+                        break;
+                    }
+
+                    string testPath2 = dir.Name + "/" + file.Name;
+                    byte[] testBytes2 = Encoding.UTF8.GetBytes(testPath2);
+                    uint computed2 = crc.Compute(testBytes2);
+                    if (computed2 == file.Hash)
+                    {
+                        hashToPathCache[file.Hash] = testPath2;
+                        break;
+                    }
+                }
+            }
+        }
+
         private void BuildNewBnd(string originalBndPath, string inputFolderPath)
         {
             string outputBndPath = Path.Combine(
@@ -101,46 +135,35 @@ namespace BusouShinki_BND
                 Path.GetFileNameWithoutExtension(originalBndPath) + "_new.bnd"
             );
 
-            // Create a temporary copy of the original BND. We will modify this file.
             File.Copy(originalBndPath, outputBndPath, true);
             Console.WriteLine($"[INIT] Created temporary file '{Path.GetFileName(outputBndPath)}'.");
+
+            // Normalize disk file paths once
+            var diskFiles = Directory.GetFiles(inputFolderPath, "*", SearchOption.AllDirectories)
+                .ToDictionary(
+                    p => p.Substring(inputFolderPath.Length + 1).Replace('\\', '/'),
+                    p => p,
+                    StringComparer.OrdinalIgnoreCase
+                );
+
+            Console.WriteLine($"[REPACK] Found {diskFiles.Count} files in input folder for repacking.");
+
+            var fileEntries = entries.Where(e => e.FileSize > 0).OrderBy(e => e.FileOffset).ToList();
+
+            // Pre-load original BND data into memory for missing files
+            byte[] originalBndData = File.ReadAllBytes(originalBndPath);
 
             using (var fs = new FileStream(outputBndPath, FileMode.Open, FileAccess.ReadWrite))
             using (var bw = new BinaryWriter(fs))
             {
-                // Sorting the logical write order entries by their original offset.
-                var fileEntries = entries.Where(e => e.FileSize > 0).OrderBy(e => e.FileOffset).ToList();
-
-                // We use the 'chunks' value from the header as the starting point for our new data.
                 long currentOffset = chunks;
 
-                // Find all files in the input directory to build a lookup map
-                var diskFiles = Directory.GetFiles(inputFolderPath, "*", SearchOption.AllDirectories)
-                    .ToDictionary(p => p.Substring(inputFolderPath.Length + 1).Replace('\\', '/'), p => p);
-
-                Console.WriteLine($"[REPACK] Found {diskFiles.Count} files in input folder for repacking.");
-
-                // Repack each file entry
                 foreach (var entry in fileEntries)
                 {
                     byte[] data;
-                    string relativePath = entry.Name;
-
-                    // Directories might have a different strings in the BND (e.g., "models/")
-                    // We will need to find to path by checking against directory entries.
-                    if (!diskFiles.ContainsKey(relativePath))
-                    {
-                        foreach (var dirEntry in entries.Where(e => e.FileSize == 0))
-                        {
-                            string testPath = dirEntry.Name + entry.Name;
-                            byte[] testBytes = Encoding.UTF8.GetBytes(testPath);
-                            if (crc.Compute(testBytes) == entry.Hash) //CRC32 Check
-                            {
-                                relativePath = testPath;
-                                break;
-                            }
-                        }
-                    }
+                    string relativePath = hashToPathCache.ContainsKey(entry.Hash)
+                        ? hashToPathCache[entry.Hash]
+                        : entry.Name;
 
                     if (diskFiles.TryGetValue(relativePath, out string diskFilePath))
                     {
@@ -151,43 +174,31 @@ namespace BusouShinki_BND
                     {
                         // If file not found in input folder, re-use original data
                         Console.WriteLine($"[NO MATCH] >> {relativePath} = 0x{entry.Hash:X8} -> [Using Original Data]");
-                        using (var originalFs = new FileStream(originalBndPath, FileMode.Open, FileAccess.Read))
-                        using (var originalBr = new BinaryReader(originalFs))
-                        {
-                            originalFs.Position = entry.FileOffset;
-                            data = originalBr.ReadBytes(entry.FileSize);
-                        }
+                        data = new byte[entry.FileSize];
+                        Buffer.BlockCopy(originalBndData, entry.FileOffset, data, 0, entry.FileSize);
                     }
 
-                    // Align the current position to 16 bytes before writing
+                    // Align each EOF data to 16-byte boundary 
                     long alignedOffset = (currentOffset + 15) & ~15;
-                    if (alignedOffset > fs.Length)
-                    {
-                        fs.SetLength(alignedOffset); // Ensure stream is long enough for padding
-                    }
+                    long padding = alignedOffset - currentOffset;
 
-                    fs.Position = currentOffset;
-                    int padding = (int)(alignedOffset - currentOffset);
                     if (padding > 0)
                     {
-                        bw.Write(new byte[padding]);
+                        fs.Position = currentOffset;
+                        fs.Write(new byte[padding], 0, (int)padding);
                     }
-                    currentOffset = alignedOffset;
 
-                    // Update entry info in our memory list
-                    entry.FileOffset = (int)currentOffset;
+                    // Update entry info
+                    entry.FileOffset = (int)alignedOffset;
                     entry.FileSize = data.Length;
 
-                    // Write the file data to the new BND
-                    fs.Position = currentOffset;
-                    bw.Write(data);
+                    fs.Position = alignedOffset;
+                    fs.Write(data, 0, data.Length);
                     Console.WriteLine($"[WRITE] Wrote {entry.Name} ({entry.FileSize} bytes) at offset 0x{entry.FileOffset:X}");
 
-                    // Update offset for the next file
-                    currentOffset += data.Length;
+                    currentOffset = alignedOffset + data.Length;
                 }
 
-                // Remove old junk data
                 Console.WriteLine($"Cleaning Up...");
                 fs.SetLength(currentOffset);
 
@@ -201,11 +212,11 @@ namespace BusouShinki_BND
                         entry.FileOffset = 0;
                     }
 
-                    bw.BaseStream.Position = entry.TablePosition;
+                    fs.Position = entry.TablePosition;
                     bw.Write(entry.Hash);
                     bw.Write(entry.EntryInfoOffset);
-                    bw.Write(entry.FileOffset); // New offset
-                    bw.Write(entry.FileSize);   // New size
+                    bw.Write(entry.FileOffset); // New offset being written
+                    bw.Write(entry.FileSize);   // New size being written
                 }
             }
             Console.WriteLine($"[SUCCESS] Repacked BND saved to '{Path.GetFileName(outputBndPath)}'.");
